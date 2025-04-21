@@ -6,6 +6,7 @@ import json                                             # JSON库：负责数据
 from flask import Flask, render_template, request       # Flask库：负责Web框架
 from flask_socketio import SocketIO, emit               # Flask-SocketIO库：负责WebSocket通信
 from datetime import datetime                           # datetime库：负责时间和日期的处理
+import signal                                           # 信号处理库：负责处理系统信号
 
 # 使用eventlet进行异步处理 解决Flask-SocketIO与ZeroMQ的阻塞问题
 eventlet.monkey_patch()
@@ -41,36 +42,76 @@ try:
 except zmq.error.ZMQError as e:
     print(f"ZMQ错误: {e}")
     sys.exit(1)
-# 创建一个订阅套接字，用于接收消息
-sub_socket = context.socket(zmq.SUB)
-# 获取环境变量ZMQ_HOST，如果没有设置，则使用localhost，适用于多个容器之间的通信
-zmq_host = os.environ.get('ZMQ_HOST', 'localhost')
-# 订阅者连接到发布者的地址
-sub_socket.connect(f"tcp://{zmq_host}:5555")
-# 设置订阅过滤器，空字符串表示接收所有消息
-sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
 
-# 定义一个ZeroMQ监听器函数
-# 该函数会在后台运行，负责接收消息并广播给所有客户端
+# 支持多个ZMQ_HOST
+zmq_hosts = os.environ.get('ZMQ_HOST', 'localhost').split(',')
+sub_sockets = []
+print(f"ZMQ主机列表: {zmq_hosts}")
+
+# 为每个主机创建一个订阅socket
+def connect_to_zmq_hosts():
+    global sub_sockets
+    # 清空现有socket列表
+    for sock in sub_sockets:
+        sock.close()
+    sub_sockets = []
+    
+    # 为每个主机创建新的socket连接
+    for host in zmq_hosts:
+        if host.strip():
+            retry_count = 0
+            max_retries = 5
+            connected = False
+            
+            while not connected and retry_count < max_retries:
+                try:
+                    sub_socket = context.socket(zmq.SUB)
+                    print(f"尝试连接到ZMQ主机: {host.strip()} (尝试 {retry_count+1}/{max_retries})")
+                    sub_socket.connect(f"tcp://{host.strip()}:5555")
+                    sub_socket.setsockopt_string(zmq.SUBSCRIBE, "")
+                    sub_sockets.append(sub_socket)
+                    connected = True
+                    print(f"成功连接到ZMQ主机: {host.strip()}")
+                except zmq.error.ZMQError as e:
+                    retry_count += 1
+                    print(f"连接到 {host.strip()} 失败: {e}，将在5秒后重试")
+                    socketio.sleep(5)  # 使用socketio.sleep而不是time.sleep保持异步
+            
+            if not connected:
+                print(f"无法连接到ZMQ主机: {host.strip()}，已达到最大重试次数")
+
+# 启动一个后台任务来处理ZMQ连接
+socketio.start_background_task(connect_to_zmq_hosts)
+
 def zmq_listener():
     while True:
-        try:
-            # 非阻塞接收信息
-            msg = sub_socket.recv(flags=zmq.NOBLOCK)
-        # 如果没有消息，则捕获异常
-        # zmq.Again异常表示没有消息可读
-        # 这里使用了socket.sleep()来让出执行权，使得在sleep期间可以处理其他事件
-        except zmq.Again:
-            socketio.sleep(0.01)
-        # 如果接收到消息，则进行处理
-        else:
-            # 解析消息并广播给所有客户端
+        for sock in sub_sockets:
             try:
+                msg = sock.recv(flags=zmq.NOBLOCK)
                 message_data = json.loads(msg.decode('utf-8'))
-                # 将消息添加到聊天历史中
-                socketio.emit('chat_message', message_data)
+                
+                # 根据消息类型处理
+                if message_data.get('type') == 'system':
+                    # 处理系统消息
+                    if 'online_users' in message_data:
+                        remote_users = message_data['online_users']
+                        socketio.emit('user_list', {'users': remote_users})
+                    
+                    socketio.emit('chat_message', message_data)
+                    
+                elif message_data.get('type') == 'voice':
+                    # 处理语音消息
+                    socketio.emit('voice_message', message_data)
+                else:
+                    # 处理文本消息
+                    socketio.emit('chat_message', message_data)
+                    
+            except zmq.Again:
+                pass
             except Exception as e:
                 print(f"消息处理错误: {e}")
+                
+        socketio.sleep(0.01)
 
 # 启动ZeroMQ监听器
 # 使用socketio.start_background_task()来启动一个后台任务
@@ -91,37 +132,30 @@ def get_history():
 # 处理用户加入聊天室，join事件来自客户端
 @socketio.on('join')
 def handle_join(data):
-    # 获取用户名，默认为'Anonymous'
     username = data.get('username', 'Anonymous')
-    # 获取用户ID，使用request.sid作为唯一标识
-    # request.sid是Flask-SocketIO为每个连接生成的唯一ID
     user_id = request.sid
-    # 将用户添加到在线用户列表中
-    # 使用user_id作为键，username作为值
     online_users[user_id] = username
     
-    # 创建加入消息
+    # 包含完整的用户列表
     join_message = {
         'type': 'system',
+        'event': 'join',
         'username': 'System',
+        'user_joined': username,
         'message': f'{username} 加入了聊天室',
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'online_users': list(online_users.values())  # 包含用户列表
     }
-    # 将加入消息添加到聊天历史中
     chat_history.append(join_message)
     
-    # 发送历史消息给新用户
-    # emit参数解释：
-    # 'chat_history'：事件名称，客户端通过监听该事件来接收消息
-    # {'history': chat_history[-50:]}：要发送的数据，[-50:]采用切片操作，表示只发送最近50条消息
-    # 这里不进行broadcast，只将最近50条消息发送给新用户
+    # 发送历史消息只给当前用户
     emit('chat_history', {'history': chat_history[-50:]})
-
-    # 通知所有用户有新用户加入
-    emit('chat_message', join_message, broadcast=True)
     
-    # 更新在线用户列表
+    # 本地广播用户列表更新
     emit('user_list', {'users': list(online_users.values())}, broadcast=True)
+    
+    # 通过ZeroMQ广播加入消息
+    pub_socket.send(json.dumps(join_message).encode('utf-8'))
 
 # 处理用户离开，disconnect无需在客户端触发
 # 该事件会在用户关闭浏览器或断开连接时自动触发
@@ -132,60 +166,91 @@ def handle_disconnect():
         username = online_users[user_id]
         leave_message = {
             'type': 'system',
+            'event': 'leave',  # 添加事件类型
             'username': 'System',
+            'user_left': username,  # 记录谁离开了
             'message': f'{username} 离开了聊天室',
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         chat_history.append(leave_message)
-        # 通知所有用户有用户离开
-        emit('chat_message', leave_message, broadcast=True)
         
-        # 从在线用户中移除
+        # 通过ZeroMQ广播离开消息
+        pub_socket.send(json.dumps(leave_message).encode('utf-8'))
+        
+        # 本地处理
         del online_users[user_id]
-        # 更新在线用户列表
         emit('user_list', {'users': list(online_users.values())}, broadcast=True)
 
-# 处理文本消息而非音频
+# 修改handle_message函数，添加消息ID
 @socketio.on('chat_message')
 def handle_message(data):
     username = online_users.get(request.sid, 'Anonymous')
+    # 生成唯一消息ID (使用时间戳和用户ID)
+    message_id = f"{request.sid}-{datetime.now().timestamp()}"
     message_data = {
         'type': 'message',
         'username': username,
         'message': data.get('message', ''),
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'message_id': message_id  # 添加消息ID
     }
     
     # 保存到历史记录
     chat_history.append(message_data)
     
-    # 通过ZMQ发布消息
+    # 先直接在本地广播，确保发送者能看到自己的消息
+    emit('chat_message', message_data, broadcast=True)
+    
+    # 然后通过ZMQ发布消息给其他服务器
     pub_socket.send(json.dumps(message_data).encode('utf-8'))
 
 # 处理语音消息
 @socketio.on('voice_message')
 def handle_voice_message(data):
     username = online_users.get(request.sid, 'Anonymous')
+    # 生成唯一消息ID
+    message_id = f"{request.sid}-voice-{datetime.now().timestamp()}"
     message_data = {
         'type': 'voice',
         'username': username,
         'audio_data': data.get('audio_data', ''),
-        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'message_id': message_id
     }
     
     # 直接广播到所有客户端
     emit('voice_message', message_data, broadcast=True)
+    
+    # 通过ZeroMQ发布给其他服务器
+    pub_socket.send(json.dumps(message_data).encode('utf-8'))
 
 if __name__ == '__main__':
-    print("聊天服务器运行在 http://0.0.0.0:5002")
+    # 从环境变量获取端口，默认5002
+    port = int(os.environ.get('PORT', 5002))
+    
+    # 定义信号处理函数，确保容器优雅关闭
+    def signal_handler(sig, frame):
+        print("正在关闭服务器...")
+        pub_socket.close()
+        for sock in sub_sockets:
+            sock.close()
+        context.term()
+        sys.exit(0)
+    
+    # 注册信号处理器
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    print(f"聊天服务器运行在 0.0.0.0:{port}")
     try:
         # 启动Flask-SocketIO服务器
-        socketio.run(app, host='0.0.0.0', port=5002, debug=True, use_reloader=False)
+        socketio.run(app, host='0.0.0.0', port=port, debug=True, use_reloader=False)
     except OSError as e:
         print(f"启动服务器失败: {e}")
         print("可能端口已被占用，请尝试关闭占用该端口的应用或使用不同端口")
         # 清理资源
         pub_socket.close()
-        sub_socket.close()
+        for sock in sub_sockets:
+            sock.close()
         context.term()
         sys.exit(1)

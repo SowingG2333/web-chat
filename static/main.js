@@ -254,7 +254,7 @@ function updateUserList(users) {
     });
     
     // 更新在线用户数量显示
-    document.getElementById('online-status').textContent = `在线用户: ${users.length}`;
+    document.getElementById('online-status').textContent = `当前服务器在线用户: ${users.length}`;
 }
 
 // 处理聊天消息
