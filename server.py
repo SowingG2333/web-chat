@@ -244,7 +244,7 @@ if __name__ == '__main__':
     print(f"聊天服务器运行在 0.0.0.0:{port}")
     try:
         # 启动Flask-SocketIO服务器
-        socketio.run(app, host='0.0.0.0', port=port, debug=True, use_reloader=False)
+        socketio.run(app, host='localhost', port=port, debug=True, use_reloader=False)
     except OSError as e:
         print(f"启动服务器失败: {e}")
         print("可能端口已被占用，请尝试关闭占用该端口的应用或使用不同端口")
